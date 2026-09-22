@@ -1,17 +1,19 @@
 # provide ENV=dev to use .env.dev instead of .env
 ENV_LOADED :=
 
+# run make ENV=prod
 ifeq ($(ENV), prod)
     ifneq (,$(wildcard ./.env))
         include .env
         export
-				ENV_LOADED := Loaded config from .env
+		ENV_LOADED := Loaded config from .env
     endif
+# run just make (or make ENV=dev)
 else
     ifneq (,$(wildcard ./.env.dev))
         include .env.dev
         export
-				ENV_LOADED := Loaded config from .env.dev
+		ENV_LOADED := Loaded config from .env.dev
     endif
 endif
 
@@ -32,7 +34,7 @@ serve-frontend: slash-command ## run the Discord bot as a hot-reloading "dev" se
 
 slash-command: frontend-secrets ## register the bot's slash command with Discord
 	@tasks/pretty_log.sh "Assumes you've set up your bot in Discord"
-	MODAL_ENVIRONMENT=$(ENV) modal run bot::create_slash_command
+	MODAL_ENVIRONMENT=$(ENV) modal run bot.py::create_slash_command
 	@tasks/pretty_log.sh "Slash command registered."
 
 backend: secrets ## deploy the Q&A backend on Modal
