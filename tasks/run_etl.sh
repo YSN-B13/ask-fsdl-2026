@@ -35,6 +35,10 @@ while (( "$#" )); do
       echo "Error: Unsupported flag $1" >&2
       exit 1
       ;;
+    *)
+      echo "Error: Unrecognized argument $1" >&2
+      exit 1
+      ;;
   esac
 done
 
@@ -45,7 +49,7 @@ collection=${collection:-$MONGODB_COLLECTION}
 set --
 source tasks/pretty_log.sh
 
-if [ $drop ]; then
+if [ "$drop" = true ]; then
   pretty_log "Dropping collection $collection in $db"
   modal run app.py::drop_docs --db "$db" --collection "$collection"
 fi
