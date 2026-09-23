@@ -1,4 +1,7 @@
 -r requirements.txt
-black>=26.0.0
+
+# Development tooling
+black>=25.11.0
+ruff>=0.14.0
 pre-commit>=4.0.0
-ruff>=0.16.0
+jupyterlab>=4.0.0
