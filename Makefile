@@ -53,9 +53,9 @@ vector-index: secrets ## adds a FAISS vector index into the corpus to the applic
 	@tasks/pretty_log.sh "Assumes you've set up the document storage, see document-store"
 	MODAL_ENVIRONMENT=$(ENV) modal run app.py::stub.create_vector_index --db $(MONGODB_DATABASE) --collection $(MONGODB_COLLECTION)
 
-document-store: secrets ## creates a MongoDB collection that contains the document corpus
+document-store: secrets ## rebuilds a MongoDB collection that contains the document corpus
 	@tasks/pretty_log.sh "See docstore.py and the ETL notebook for details"
-	MODAL_ENVIRONMENT=$(ENV) tasks/run_etl.sh --drop --db $(MONGODB_DATABASE) --collection $(MONGODB_COLLECTION)
+	MODAL_ENVIRONMENT=$(ENV) bash tasks/run_etl.sh --drop --db $(MONGODB_DATABASE) --collection $(MONGODB_COLLECTION)
 
 debugger: modal-auth ## starts a debugger running in a Modal container but accessible via the terminal
 	MODAL_ENVIRONMENT=$(ENV) modal shell app.py
@@ -68,8 +68,8 @@ frontend-secrets: modal-auth
 	MODAL_ENVIRONMENT=$(ENV) bash tasks/send_frontend_secrets_to_modal.sh
 
 secrets: modal-auth  ## pushes secrets from .env to Modal
-	@$(if $(value OPENAI_API_KEY),, \
-		$(error OPENAI_API_KEY is not set. Please set it before running this target.))
+	@$(if $(value GEMINI_API_KEY),, \
+		$(error GEMINI_API_KEY is not set. Please set it before running this target.))
 	@$(if $(value MONGODB_HOST),, \
 		$(error MONGODB_HOST is not set. Please set it before running this target.))
 	@$(if $(value MONGODB_USER),, \
