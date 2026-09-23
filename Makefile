@@ -1,5 +1,10 @@
-# provide ENV=dev to use .env.dev instead of .env
+# Default: loads .env.dev. Pass ENV=prod to load .env instead.
 ENV_LOADED :=
+
+# default environment is dev; override with `make ENV=prod <target>`
+ENV ?= dev
+
+PIP_FLAGS ?= -qqq
 
 # run make ENV=prod
 ifeq ($(ENV), prod)
@@ -17,7 +22,9 @@ else
     endif
 endif
 
-.PHONY: help
+.PHONY: help it-all frontend serve-frontend slash-command backend serve-backend \
+        cli-query vector-index document-store debugger frontend-secrets secrets \
+        modal-auth modal-token environment dev-environment logo
 .DEFAULT_GOAL := help
 
 help: logo ## get a list of all the targets, and their short descriptions
@@ -32,7 +39,7 @@ frontend: slash-command ## deploy the Discord bot on Modal
 serve-frontend: slash-command ## run the Discord bot as a hot-reloading "dev" server on Modal
 	MODAL_ENVIRONMENT=$(ENV) bash tasks/run_frontend_modal.sh serve
 
-slash-command: frontend-secrets ## register the bot's slash command with Discord
+slash-command: secrets frontend-secrets ## register the bot's slash command with Discord
 	@tasks/pretty_log.sh "Assumes you've set up your bot in Discord"
 	MODAL_ENVIRONMENT=$(ENV) modal run bot.py::create_slash_command
 	@tasks/pretty_log.sh "Slash command registered."
@@ -47,15 +54,19 @@ serve-backend: secrets ## run the Q&A backend as a hot-reloading "dev" server on
 
 cli-query: secrets ## run a query via a CLI interface
 	@tasks/pretty_log.sh "Assumes you've set up the vector index"
-	MODAL_ENVIRONMENT=$(ENV) modal run app.py::stub.cli --query "${QUERY}"
+	MODAL_ENVIRONMENT=$(ENV) modal run app.py::cli --query "$(QUERY)"
 
 vector-index: secrets ## adds a FAISS vector index into the corpus to the application
 	@tasks/pretty_log.sh "Assumes you've set up the document storage, see document-store"
-	MODAL_ENVIRONMENT=$(ENV) modal run app.py::stub.create_vector_index --db $(MONGODB_DATABASE) --collection $(MONGODB_COLLECTION)
+	MODAL_ENVIRONMENT=$(ENV) modal run app.py::create_vector_index --db $(MONGODB_DATABASE) --collection $(MONGODB_COLLECTION)
 
 document-store: secrets ## rebuilds a MongoDB collection that contains the document corpus
 	@tasks/pretty_log.sh "See docstore.py and the ETL notebook for details"
-	MODAL_ENVIRONMENT=$(ENV) bash tasks/run_etl.sh --drop --db $(MONGODB_DATABASE) --collection $(MONGODB_COLLECTION)
+	ifeq ($(ENV), prod)
+		MODAL_ENVIRONMENT=$(ENV) bash tasks/run_etl.sh --db $(MONGODB_DATABASE) --collection $(MONGODB_COLLECTION)
+	else
+		MODAL_ENVIRONMENT=$(ENV) bash tasks/run_etl.sh --drop --db $(MONGODB_DATABASE) --collection $(MONGODB_COLLECTION)
+	endif
 
 debugger: modal-auth ## starts a debugger running in a Modal container but accessible via the terminal
 	MODAL_ENVIRONMENT=$(ENV) modal shell app.py
@@ -85,23 +96,22 @@ modal-auth: environment ## confirms authentication with Modal, using secrets fro
 	@$(if $(value MODAL_TOKEN_SECRET),, \
 		$(error MODAL_TOKEN_SECRET is not set. Please set it before running this target. See make modal-token.))
 	@modal token set --token-id $(MODAL_TOKEN_ID) --token-secret $(MODAL_TOKEN_SECRET)
-	bash tasks/setup_environment_modal.sh $(ENV)
+	MODAL_ENVIRONMENT=$(ENV) bash tasks/setup_environment_modal.sh $(ENV)
 
-modal-token: environment ## creates token ID and secret for authentication with modal
+modal-token: ## creates token ID and secret for authentication with modal
 	modal token new
-	@tasks/pretty_log.sh "Copy the token info from the file mentioned above into .env"
+	@tasks/pretty_log.sh "Copy the token info from the file mentioned above into $(if $(filter prod,$(ENV)),.env,.env.dev)"
 
 environment: ## installs required environment for deployment and corpus generation
 	@if [ -z "$(ENV_LOADED)" ]; then \
-			echo "Error: Configuration file not found" >&2; \
-			exit 1; \
-    else \
-			tasks/pretty_log.sh "$(ENV_LOADED)"; \
+		echo "Error: $(ENV_FILE) not found. Copy .env.example to $(ENV_FILE) and fill it in." >&2; \
+		exit 1; \
 	fi
-	python -m pip install -qqq -r requirements.txt
+	@tasks/pretty_log.sh "$(ENV_LOADED)"
+	python -m pip install $(PIP_FLAGS) -r requirements.txt
 
 dev-environment: environment  ## installs required environment for development
-	python -m pip install -qqq -r requirements-dev.txt
+	python -m pip install $(PIP_FLAGS) -r requirements-dev.txt
 
 logo:  ## prints the logo
-	@cat logo.txt; echo "\n"
+	@cat logo.txt; printf "\n"
