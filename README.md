@@ -67,3 +67,15 @@ to run the bot serverlessly.
 We use
 [Gantry](https://gantry.io)
 to monitor model behvaior in production and collect feedback from users.
+
+## How To use.
+
+1. **Linux / macOS / WSL:**
+
+```
+python3 -m venv .venv
+
+.venv/bin/python -m pip install --upgrade pip
+
+.venv/bin/python -m pip install -r requirements-dev.txt
+```
