@@ -1,103 +1,85 @@
-"""Builds a CLI, Webhook, and Gradio app for Q&A on the Full Stack corpus.
-
-For details on corpus construction, see the accompanying notebook."""
-import modal
-from fastapi import FastAPI
+"""
+Builds a CLI, Webhook, and Gradio app for Q&A on the Full Stack corpus.
+For details on corpus construction, see the accompanying notebook.
+"""
+from langchain_classic.chains.combine_documents import create_stuff_documents_chain
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_google_genai import ChatGoogleGenerativeAI
 from fastapi.responses import RedirectResponse
-
-import vecstore
+from gradio.routes import App
 from utils import pretty_log
+from fastapi import FastAPI
+import gradio as gr
+import vecstore
+import docstore
+import prompts
+import modal
+import json
+import os
 
 
 # definition of our container image for jobs on Modal
 # Modal gets really powerful when you start using multiple images!
-image = modal.Image.debian_slim(  # we start from a lightweight linux distro
-    python_version="3.10"  # we add a recent Python version
-).pip_install(  # and we install the following packages:
-    "langchain==0.0.184",
-    # 🦜🔗: a framework for building apps with LLMs
-    "openai~=0.27.7",
-    # high-quality language models and cheap embeddings
-    "tiktoken",
-    # tokenizer for OpenAI models
-    "faiss-cpu",
-    # vector storage and similarity search
-    "pymongo[srv]==3.11",
-    # python client for MongoDB, our data persistence solution
-    "gradio~=3.34",
-    # simple web UIs in Python, from 🤗
-    "gantry==0.5.6",
-    # 🏗️: monitoring, observability, and continual improvement for ML systems
+image = (
+    modal.Image.debian_slim(python_version="3.10")
+    .pip_install(  # and we install the following packages:
+        "langchain>=1.0.0",
+        "langchain-google-genai>=4.0.0",
+        "langchain-classic>=1.0",          # ← provides create_stuff_documents_chain
+        "langchain-community>=0.3",        # ← provides FAISS vector store
+        "langchain-text-splitters>=0.3",    # ← needed for RecursiveCharacterTextSplitter
+        # 🦜🔗: a framework for building apps with LLMs, and the Google Gemini integration
+        "faiss-cpu>=1.15.1",
+        # vector storage and similarity search
+        "pymongo>=4.18.1",
+        # python client for MongoDB, our data persistence solution
+        "gradio>=6.0.0",
+        # simple web UIs in Python, from 🤗
+    )
+    # we make our local modules available to the container
+    .add_local_python_source("vecstore", "docstore", "utils", "prompts")
 )
 
-# we define a Stub to hold all the pieces of our app
-# most of the rest of this file just adds features onto this Stub
-stub = modal.Stub(
+VECTOR_DIR = vecstore.VECTOR_DIR
+vector_storage = modal.Volume.from_name("vector-vol", create_if_missing=True)
+
+app = modal.App(
     name="askfsdl-backend",
     image=image,
     secrets=[
         # this is where we add API keys, passwords, and URLs, which are stored on Modal
         modal.Secret.from_name("mongodb-fsdl"),
         modal.Secret.from_name("openai-api-key-fsdl"),
-        modal.Secret.from_name("gantry-api-key-fsdl"),
     ],
-    mounts=[
-        # we make our local modules available to the container
-        modal.Mount.from_local_python_packages(
-            "vecstore", "docstore", "utils", "prompts"
-        )
-    ],
-)
-
-VECTOR_DIR = vecstore.VECTOR_DIR
-vector_storage = modal.NetworkFileSystem.persisted("vector-vol")
-
-
-@stub.function(
-    image=image,
-    network_file_systems={
+    volumes={
         str(VECTOR_DIR): vector_storage,
     },
 )
-@modal.web_endpoint(method="GET")
-def web(query: str, request_id=None):
-    """Exposes our Q&A chain for queries via a web endpoint."""
-    import os
 
-    pretty_log(
-        f"handling request with client-provided id: {request_id}"
-    ) if request_id else None
+
+@app.function()
+@modal.fastapi_endpoint(method="GET")
+def web(query: str, request_id: str | None = None):
+    """Exposes our Q&A chain for queries via a web endpoint."""
+    if request_id:
+        pretty_log(f"handling request with client-provided id: {request_id}")
 
     answer = qanda.remote(
         query,
         request_id=request_id,
-        with_logging=bool(os.environ.get("GANTRY_API_KEY")),
     )
     return {"answer": answer}
 
 
-@stub.function(
-    image=image,
-    network_file_systems={
-        str(VECTOR_DIR): vector_storage,
-    },
-    keep_warm=1,
-)
-def qanda(query: str, request_id=None, with_logging: bool = False) -> str:
+@app.function(min_containers=1)
+def qanda(query: str, request_id: str | None = None) -> str:
     """Runs sourced Q&A for a query using LangChain.
-
     Arguments:
         query: The query to run Q&A on.
         request_id: A unique identifier for the request.
         with_logging: If True, logs the interaction to Gantry.
     """
-    from langchain.chains.qa_with_sources import load_qa_with_sources_chain
-    from langchain.chat_models import ChatOpenAI
-
-    import prompts
-    import vecstore
-
-    embedding_engine = vecstore.get_embedding_engine(allowed_special="all")
+    embedding_engine = vecstore.get_embedding_engine()
 
     pretty_log("connecting to vector storage")
     vector_index = vecstore.connect_to_vector_index(
@@ -109,46 +91,32 @@ def qanda(query: str, request_id=None, with_logging: bool = False) -> str:
     pretty_log(f"running on query: {query}")
     pretty_log("selecting sources by similarity to query")
     sources_and_scores = vector_index.similarity_search_with_score(query, k=3)
-
-    sources, scores = zip(*sources_and_scores)
+    if not sources_and_scores:
+        pretty_log("no sources found for query")
+        return "I could not find any relevant sources to answer that question."
+    sources, _scores = zip(*sources_and_scores)
 
     pretty_log("running query against Q&A chain")
 
-    llm = ChatOpenAI(model_name="gpt-4", temperature=0, max_tokens=256)
-    chain = load_qa_with_sources_chain(
+    llm = ChatGoogleGenerativeAI(model="gemini-3.7-flash", temperature=0, max_output_tokens=256)
+    chain = create_stuff_documents_chain(
         llm,
-        chain_type="stuff",
-        verbose=with_logging,
         prompt=prompts.main,
         document_variable_name="sources",
     )
 
-    result = chain(
-        {"input_documents": sources, "question": query}, return_only_outputs=True
-    )
-    answer = result["output_text"]
+    result = chain.invoke({"input": query, "sources": sources})
+    answer = result if isinstance(result, str) else result.get("output_text", str(result))
 
-    if with_logging:
-        print(answer)
-        pretty_log("logging results to gantry")
-        record_key = log_event(query, sources, answer, request_id=request_id)
-        if record_key:
-            pretty_log(f"logged to gantry with key {record_key}")
+    if request_id:
+        pretty_log(f"answered request {request_id}")
 
     return answer
 
 
-@stub.function(
-    image=image,
-    network_file_systems={
-        str(VECTOR_DIR): vector_storage,
-    },
-    cpu=8.0,  # use more cpu for vector storage creation
-)
-def create_vector_index(collection: str = None, db: str = None):
+@app.function(cpu=8.0) # use more cpu for vector storage creation
+def create_vector_index(collection: str | None = None, db: str | None = None):
     """Creates a vector index for a collection in the document database."""
-    import docstore
-
     pretty_log("connecting to document store")
     db = docstore.get_database(db)
     pretty_log(f"connected to database {db.name}")
@@ -158,87 +126,52 @@ def create_vector_index(collection: str = None, db: str = None):
     docs = docstore.get_documents(collection, db)
 
     pretty_log("splitting into bite-size chunks")
-    ids, texts, metadatas = prep_documents_for_vector_storage(docs)
+    _ids, texts, metadatas = prep_documents_for_vector_storage(docs)
+    pretty_log(f"prepared {len(texts)} chunks")
 
     pretty_log(f"sending to vector index {vecstore.INDEX_NAME}")
-    embedding_engine = vecstore.get_embedding_engine(disallowed_special=())
+    embedding_engine = vecstore.get_embedding_engine(task_type="retrieval_document")
     vector_index = vecstore.create_vector_index(
         vecstore.INDEX_NAME, embedding_engine, texts, metadatas
     )
-    vector_index.save_local(folder_path=VECTOR_DIR, index_name=vecstore.INDEX_NAME)
     pretty_log(f"vector index {vecstore.INDEX_NAME} created")
-
-
-@stub.function(image=image)
-def drop_docs(collection: str = None, db: str = None):
-    """Drops a collection from the document storage."""
-    import docstore
-
-    docstore.drop(collection, db)
-
-
-def log_event(query: str, sources, answer: str, request_id=None):
-    """Logs the event to Gantry."""
-    import os
-
-    import gantry
-
-    if not os.environ.get("GANTRY_API_KEY"):
-        pretty_log("No Gantry API key found, skipping logging")
-        return None
-
-    gantry.init(api_key=os.environ["GANTRY_API_KEY"], environment="modal")
-
-    application = "ask-fsdl"
-    join_key = str(request_id) if request_id else None
-
-    inputs = {"question": query}
-    inputs["docs"] = "\n\n---\n\n".join(source.page_content for source in sources)
-    inputs["sources"] = "\n\n---\n\n".join(
-        source.metadata["source"] for source in sources
-    )
-    outputs = {"answer_text": answer}
-
-    record_key = gantry.log_record(
-        application=application, inputs=inputs, outputs=outputs, join_key=join_key
-    )
-
-    return record_key
 
 
 def prep_documents_for_vector_storage(documents):
     """Prepare documents from document store for embedding and vector storage.
-
     Documents are split into chunks so that they can be used with sourced Q&A.
-
     Arguments:
         documents: A list of LangChain.Documents with text, metadata, and a hash ID.
     """
-    from langchain.text_splitter import RecursiveCharacterTextSplitter
-
-    text_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
-        chunk_size=500, chunk_overlap=100, allowed_special="all"
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=500, 
+        chunk_overlap=100
     )
     ids, texts, metadatas = [], [], []
     for document in documents:
         text, metadata = document["text"], document["metadata"]
         doc_texts = text_splitter.split_text(text)
+        if not doc_texts:
+            continue
         doc_metadatas = [metadata] * len(doc_texts)
-        ids += [metadata.get("sha256")] * len(doc_texts)
+        sha = metadata.get("sha256", "")
+        ids += [sha] * len(doc_texts)
         texts += doc_texts
         metadatas += doc_metadatas
 
     return ids, texts, metadatas
 
 
-@stub.function(
-    image=image,
-    network_file_systems={
-        str(VECTOR_DIR): vector_storage,
-    },
-)
+@app.function()
+def drop_docs(collection: str | None = None, db: str | None = None):
+    """Drops a collection from the document storage."""
+    docstore.drop(collection, db)
+
+
+@app.function()
 def cli(query: str):
-    answer = qanda.remote(query, with_logging=False)
+    """Run a one-shot query against the Q&A chain, for local testing."""
+    answer = qanda.remote(query)
     pretty_log("🦜 ANSWER 🦜")
     print(answer)
 
@@ -257,63 +190,43 @@ async def redirect_docs():
     return "/gradio/docs"
 
 
-@stub.function(
-    image=image,
-    network_file_systems={
-        str(VECTOR_DIR): vector_storage,
-    },
-    keep_warm=1,
-)
-@modal.asgi_app(label="askfsdl-backend")
+@app.function()
+@modal.asgi_app()
 def fastapi_app():
     """A simple Gradio interface for debugging."""
-    import gradio as gr
-    from gradio.routes import App
 
-    def chain_with_logging(*args, **kwargs):
-        return qanda(*args, with_logging=True, **kwargs)
-
-    inputs = gr.TextArea(
-        label="Question",
-        value="What is zero-shot chain-of-thought prompting?",
-        show_label=True,
-    )
-    outputs = gr.TextArea(
-        label="Answer", value="The answer will appear here.", show_label=True
-    )
+    def query_with_sources(question: str) -> str:
+        return qanda.remote(question)
 
     interface = gr.Interface(
-        fn=chain_with_logging,
-        inputs=inputs,
-        outputs=outputs,
+        fn=query_with_sources,
+        inputs=gr.TextArea(
+            label="Question",
+            value="What is zero-shot chain-of-thought prompting?",
+            show_label=True,
+        ),
+        outputs=gr.TextArea(
+            label="Answer",
+            value="The answer will appear here.",
+            show_label=True,
+        ),
         title="Ask Questions About The Full Stack.",
         description="Get answers with sources from an LLM.",
         examples=[
             "What is zero-shot chain-of-thought prompting?",
             "Would you rather fight 100 LLaMA-sized GPT-4s or 1 GPT-4-sized LLaMA?",
-            "What are the differences in capabilities between GPT-3 davinci and GPT-3.5 code-davinci-002?",  # noqa: E501
+            "What are the differences in capabilities between GPT-3 davinci and GPT-3.5 code-davinci-002?",
             "What is PyTorch? How can I decide whether to choose it over TensorFlow?",
             "Is it cheaper to run experiments on cheap GPUs or expensive GPUs?",
             "How do I recruit an ML team?",
             "What is the best way to learn about ML?",
         ],
-        allow_flagging="never",
+    )
+
+    return gr.mount_gradio_app(
+        web_app,
+        interface,
+        path="/gradio",
         theme=gr.themes.Default(radius_size="none", text_size="lg"),
-        article="# GitHub Repo: https://github.com/the-full-stack/ask-fsdl",
+        app_kwargs={"docs_url": "/gradio/docs", "title": "ask-FSDL"},
     )
-
-    interface.dev_mode = False
-    interface.config = interface.get_config_file()
-    interface.validate_queue_settings()
-    gradio_app = App.create_app(
-        interface, app_kwargs={"docs_url": "/docs", "title": "ask-FSDL"}
-    )
-
-    @web_app.on_event("startup")
-    async def start_queue():
-        if gradio_app.get_blocks().enable_queue:
-            gradio_app.get_blocks().startup_events()
-
-    web_app.mount("/gradio", gradio_app)
-
-    return web_app

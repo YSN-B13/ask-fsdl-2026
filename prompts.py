@@ -1,4 +1,4 @@
-from langchain.prompts import PromptTemplate
+from langchain_core.prompts import PromptTemplate
 
 template = """This is a question-answering system over a corpus of documents created by The Full Stack, which provides news, community, and courses for people building AI-powered products.
 The documents include notes and transcripts of lectures from the Full Stack Deep Learning course, the Full Stack Large Language Models Bootcamp and select papers from the literature, as well as other sources.
@@ -18,7 +18,7 @@ We propose Zero-shot-CoT, a zero-shot template-based prompting for chain of thou
 It differs from the original chain of thought prompting [Wei et al., 2022] as it does not require
 step-by-step few-shot examples, and it differs from most of the prior template prompting [Liu et al.,
 2021b] as it is inherently task-agnostic and elicits multi-hop reasoning across a wide range of tasks
-with a single template. The core idea of our method is simple, as described in Figure 1: add Let’s
+with a single template. The core idea of our method is simple, as described in Figure 1: add Let's
 think step by step , or a a similar text (see Table 4), to extract step-by-step reasoning.
 3.1 Two-stage prompting
 Source: https://arxiv.org/pdf/2205.11916.pdf
@@ -26,14 +26,14 @@ Source: https://arxiv.org/pdf/2205.11916.pdf
 Content: step-by-step reasoning examples rather than standard question and answer examples (see Fig. 1-a).
 Such chain of thought demonstrations facilitate models to generate a reasoning path that decomposes
 the complex reasoning into multiple easier steps. Notably with CoT, the reasoning performance then
-satisﬁes the scaling laws better and jumps up with the size of the language models. For example,
+satisfies the scaling laws better and jumps up with the size of the language models. For example,
 when combined with the 540B parameter PaLM model [Chowdhery et al., 2022], chain of thought
-prompting signiﬁcantly increases the performance over standard few-shot prompting across several
+prompting significantly increases the performance over standard few-shot prompting across several
 benchmark reasoning tasks, e.g., GSM8K (17.9% !58.1%).
-While the successes of CoT prompting [Wei et al., 2022], along those of many other task-speciﬁc
-prompting work [Gao et al., 2021, Schick and Schütze, 2021, Liu et al., 2021b], are often attributed
-to LLMs’ ability for few-shot learning [Brown et al., 2020], we show that LLMs are decent zero-shot
-reasoners by adding a simple prompt, Let’s think step by step , to facilitate step-by-step thinking before
+While the successes of CoT prompting [Wei et al., 2022], along those of many other task-specific
+prompting work [Gao et al., 2021, Schick and Schutze, 2021, Liu et al., 2021b], are often attributed
+to LLMs' ability for few-shot learning [Brown et al., 2020], we show that LLMs are decent zero-shot
+reasoners by adding a simple prompt, Let's think step by step , to facilitate step-by-step thinking before
 answering each question (see Figure 1). Despite the simplicity, our Zero-shot-CoT successfully
 generates a plausible reasoning path in a zero-shot manner and reaches the correct answer in a
 problem where the standard zero-shot approach fails. Importantly, our Zero-shot-CoT is versatile and
@@ -74,7 +74,7 @@ QUESTION: {question}
 =========
 {sources}
 =========
-FINAL ANSWER:"""  # noqa: E501
+FINAL ANSWER:"""
 
 main = PromptTemplate(template=template, input_variables=["sources", "question"])
 
