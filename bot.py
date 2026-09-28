@@ -1,49 +1,68 @@
-from enum import Enum
-from fastapi import Request, FastAPI, HTTPException
+"""
+Discord bot frontend for askFSDL.
+
+Exposes an ASGI app that:
+  - Verifies incoming requests from Discord (Ed25519 signature)
+  - Replies to PINGs with PONG
+  - Handles /ask slash commands by spawning a background worker that
+    queries the askfsdl-backend qanda function and posts the answer back.
+"""
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-import os
-import aiohttp
-import json
-
-from modal import Image, Mount, Secret, Stub, asgi_app
-
+from nacl.exceptions import BadSignatureError
+from nacl.signing import VerifyKey
 from utils import pretty_log
+from enum import Enum
+import aiohttp
+import modal
+import json
+import os
 
-image = Image.debian_slim(python_version="3.10").pip_install("pynacl", "requests")
-discord_secrets = [Secret.from_name("discord-secret-fsdl")]
 
-stub = Stub(
-    "askfsdl-discord",
+image = (
+    modal.Image.debian_slim(python_version="3.10")
+    .pip_install(
+        "pynacl",      # Ed25519 signature verification for Discord webhooks
+        "requests",    # for slash command registration
+        "aiohttp",     # for sending deferred responses back to Discord
+        "fastapi",     # ASGI app
+        "uvicorn",     # ASGI server
+    )
+    .add_local_python_source("utils")
+)
+
+app = modal.App(
+    name="askfsdl-discord",
     image=image,
-    secrets=discord_secrets,
-    mounts=[Mount.from_local_python_packages("utils")],
+    secrets=[modal.Secret.from_name("discord-secret-fsdl")],
 )
 
 
 class DiscordInteractionType(Enum):
-    PING = 1  # hello from Discord
-    APPLICATION_COMMAND = 2  # an actual command
+    PING = 1                    # hello from Discord
+    APPLICATION_COMMAND = 2     # an actual command
 
 
 class DiscordResponseType(Enum):
-    PONG = 1  # hello back
-    DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE = 5  # we'll send a message later
+    PONG = 1                                    # hello back
+    DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE = 5    # we'll send a message later
 
 
 class DiscordApplicationCommandOptionType(Enum):
-    STRING = 3  # with language models, strings are all you need
+    STRING = 3    # with language models, strings are all you need
 
 
-@stub.function(
-    # keep one instance warm to reduce latency, consuming ~0.2 GB while idle
-    # this costs ~$3/month at current prices, so well within $10/month free tier credit
-    keep_warm=1,
-)
-@asgi_app(label="askfsdl-discord-bot")
-def app() -> FastAPI:
-    app = FastAPI()
+@app.function(min_containers=1)
+@modal.asgi_app()
+def asgi():
+    """The Discord webhook endpoint, wrapped in a FastAPI app.
 
-    app.add_middleware(
+    min_containers=1 keeps one container warm so Discord's 3-second
+    interaction timeout doesn't kick in during cold starts.
+    """
+    web_app = FastAPI()
+
+    web_app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
         allow_credentials=True,
@@ -51,66 +70,56 @@ def app() -> FastAPI:
         allow_headers=["*"],
     )
 
-    @app.post("/")
+    @web_app.post("/")
     async def handle_request(request: Request):
-        "Verify incoming requests and if they're a valid command spawn a response."
-
-        # while loading the body, check that it's a valid request from Discord
+        """Verify the incoming request and, if valid, spawn a response."""
         body = await verify(request)
         data = json.loads(body.decode())
 
         if data.get("type") == DiscordInteractionType.PING.value:
-            # "ack"nowledge the ping from Discord
             return {"type": DiscordResponseType.PONG.value}
 
         if data.get("type") == DiscordInteractionType.APPLICATION_COMMAND.value:
-            # this is a command interaction
-            app_id = data["application_id"]
+            application_id = data["application_id"]
             interaction_token = data["token"]
             user_id = data["member"]["user"]["id"]
-
             question = data["data"]["options"][0]["value"]
+
             pretty_log(question)
 
-            # kick off our actual response in the background
-            respond.spawn(
-                question,
-                app_id,
-                interaction_token,
-                user_id,
-            )
+            # Kick off the real response in the background; reply immediately.
+            respond.spawn(question, application_id, interaction_token, user_id)
 
-            # and respond immediately to let Discord know we're on the case
             return {
                 "type": DiscordResponseType.DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE.value
             }
 
         raise HTTPException(status_code=400, detail="Bad request")
 
-    return app
+    return web_app
 
 
-@stub.function()
+@app.function()
 async def respond(
     question: str,
     application_id: str,
     interaction_token: str,
     user_id: str,
 ):
-    """Respond to a user's question by passing it to the language model."""
-    import modal
-
+    """Query the backend and post the answer back to Discord."""
     try:
-        raw_response = await modal.Function.lookup(
-            "askfsdl-backend", "qanda"
-        ).remote.aio(question, request_id=interaction_token, with_logging=True)
+        qanda = modal.Function.from_name("askfsdl-backend", "qanda")
+        raw_response = await qanda.remote.aio(
+            question, request_id=interaction_token
+        )
         pretty_log(raw_response)
-
         response = construct_response(raw_response, user_id, question)
     except Exception as e:
-        pretty_log("Error", e)
+        pretty_log(f"Error: {e}")
         response = construct_error_message(user_id)
+
     await send_response(response, application_id, interaction_token)
+
 
 
 async def send_response(
@@ -118,105 +127,93 @@ async def send_response(
     application_id: str,
     interaction_token: str,
 ):
-    """Send a response to the user interaction."""
+    """Posts the final message to the Discord interaction webhook."""
+    url = f"https://discord.com/api/v10/webhooks/{application_id}/{interaction_token}"
+    payload_json = json.dumps({"content": response})
 
-    interaction_url = (
-        f"https://discord.com/api/v10/webhooks/{application_id}/{interaction_token}"
-    )
-
-    json_payload = {"content": f"{response}"}
-
-    payload = aiohttp.FormData()
-    payload.add_field(
-        "payload_json", json.dumps(json_payload), content_type="application/json"
-    )
+    form = aiohttp.FormData()
+    form.add_field("payload_json", payload_json, content_type="application/json")
 
     async with aiohttp.ClientSession() as session:
-        async with session.post(interaction_url, data=payload) as resp:
+        async with session.post(url, data=form) as resp:
             await resp.text()
 
 
-async def verify(request: Request):
-    """Verify that the request is from Discord."""
+async def verify(request: Request) -> bytes:
+    """Verifies the Ed25519 signature on an incoming Discord request.
 
-    from nacl.signing import VerifyKey
-    from nacl.exceptions import BadSignatureError
-
-    public_key = os.getenv("DISCORD_PUBLIC_KEY")
+    Discord refuses to interact with apps that accept unsigned requests,
+    so this must reject bad signatures with a 401.
+    """
+    public_key = os.environ["DISCORD_PUBLIC_KEY"]
     verify_key = VerifyKey(bytes.fromhex(public_key))
 
     signature = request.headers.get("X-Signature-Ed25519")
     timestamp = request.headers.get("X-Signature-Timestamp")
     body = await request.body()
 
+    if signature is None or timestamp is None:
+        raise HTTPException(status_code=401, detail="Missing signature headers")
+
     message = timestamp.encode() + body
     try:
         verify_key.verify(message, bytes.fromhex(signature))
     except BadSignatureError:
-        # IMPORTANT: if you let bad signatures through,
-        # Discord will refuse to talk to you
         raise HTTPException(status_code=401, detail="Invalid request") from None
 
     return body
 
 
 def construct_response(raw_response: str, user_id: str, question: str) -> str:
-    """Wraps the backend's response in a nice message for Discord."""
+    """Wraps the backend's answer in a friendly Discord message."""
     rating_emojis = {
         "👍": "if the response was helpful",
         "👎": "if the response was not helpful",
     }
-
     emoji_reaction_text = " or ".join(
         f"react with {emoji} {reason}" for emoji, reason in rating_emojis.items()
     )
     emoji_reaction_text = emoji_reaction_text.capitalize() + "."
 
-    response = f"""<@{user_id}> asked: _{question}_
-
-    Here's my best guess at an answer, with sources so you can follow up:
-
-    {raw_response}
-
-    Emoji react to let us know how we're doing!
-
-    {emoji_reaction_text}
-    """
-
-    return response
+    return (
+        f"<@{user_id}> asked: _{question}_\n\n"
+        f"Here's my best guess at an answer, with sources so you can follow up:\n\n"
+        f"{raw_response}\n\n"
+        f"Emoji react to let us know how we're doing!\n\n"
+        f"{emoji_reaction_text}\n"
+    )
 
 
 def construct_error_message(user_id: str) -> str:
-    import os
+    """Apologetic message shown when the backend fails."""
+    message = f"*Sorry <@{user_id}>, an error occurred while answering your question."
 
-    error_message = (
-        f"*Sorry <@{user_id}>, an error occured while answering your question."
-    )
-
-    if os.getenv("DISCORD_MAINTAINER_ID"):
-        error_message += f" I've let <@{os.getenv('DISCORD_MAINTAINER_ID')}> know."
+    maintainer_id = os.environ.get("DISCORD_MAINTAINER_ID")
+    if maintainer_id:
+        message += f" I've let <@{maintainer_id}> know."
     else:
         pretty_log("No maintainer ID set")
-        error_message += " Please try again later."
+        message += " Please try again later."
 
-    error_message += "*"
-    return error_message
+    return message + "*"
 
 
-@stub.function()
+@app.function()
 def create_slash_command(force: bool = False):
-    """Registers the slash command with Discord. Pass the force flag to re-register."""
-    import os
+    """Registers the /ask slash command with Discord.
+
+    Pass force=True to re-register even if it already exists.
+    """
     import requests
 
-    BOT_TOKEN = os.getenv("DISCORD_AUTH")
-    CLIENT_ID = os.getenv("DISCORD_CLIENT_ID")
+    bot_token = os.environ["DISCORD_AUTH"]
+    client_id = os.environ["DISCORD_CLIENT_ID"]
 
     headers = {
         "Content-Type": "application/json",
-        "Authorization": f"Bot {BOT_TOKEN}",
+        "Authorization": f"Bot {bot_token}",
     }
-    url = f"https://discord.com/api/v10/applications/{CLIENT_ID}/commands"
+    url = f"https://discord.com/api/v10/applications/{client_id}/commands"
 
     command_description = {
         "name": "ask",
@@ -232,22 +229,25 @@ def create_slash_command(force: bool = False):
         ],
     }
 
-    # first, check if the command already exists
-    response = requests.get(url, headers=headers)
+    # Check what's already registered.
+    response = requests.get(url, headers=headers, timeout=30)
     try:
         response.raise_for_status()
     except Exception as e:
-        raise Exception("Failed to create slash command") from e
+        raise Exception("Failed to fetch existing slash commands") from e
 
     commands = response.json()
-    command_exists = any(command.get("name") == "ask" for command in commands)
-
-    # and only recreate it if the force flag is set
-    if command_exists and not force:
+    if any(cmd.get("name") == "ask" for cmd in commands) and not force:
+        print("slash command /ask already registered; pass force=True to re-create")
         return
 
-    response = requests.post(url, headers=headers, json=command_description)
+    # Register (or re-register).
+    response = requests.post(
+        url, headers=headers, json=command_description, timeout=30
+    )
     try:
         response.raise_for_status()
     except Exception as e:
         raise Exception("Failed to create slash command") from e
+
+    print("slash command /ask registered")
