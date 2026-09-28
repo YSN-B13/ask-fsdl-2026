@@ -2,17 +2,34 @@
 # shellcheck source=tasks/pretty_log.sh
 set -euo pipefail
 
-GANTRY_API_KEY=${GANTRY_API_KEY:-""}
-
-# clear command-line parameters
+# Clear command-line parameters so the sourced script sees nothing.
 set --
 source tasks/pretty_log.sh
 
-modal secret create mongodb-fsdl MONGODB_USER="$MONGODB_USER" MONGODB_HOST="$MONGODB_HOST" MONGODB_PASSWORD="$MONGODB_PASSWORD"
-modal secret create openai-api-key-fsdl GEMINI_API_KEY="$GEMINI_API_KEY"
+require() {
+    if [ -z "${!1:-}" ]; then
+        echo "Error: $1 is not set. Add it to .env.dev before running this target." >&2
+        exit 1
+    fi
+}
 
-if [ "$GANTRY_API_KEY" = "" ]; then
-  pretty_log "GANTRY_API_KEY not set. Logging will not be available."
-fi
+require MONGODB_USER
+require MONGODB_PASSWORD
+require MONGODB_HOST
+require MONGODB_DATABASE
+require MONGODB_COLLECTION
+require GEMINI_API_KEY
 
-modal secret create gantry-api-key-fsdl GANTRY_API_KEY="$GANTRY_API_KEY"
+pretty_log "Pushing mongodb-fsdl secret to Modal"
+modal secret create --env dev --force mongodb-fsdl \
+    MONGODB_USER="$MONGODB_USER" \
+    MONGODB_PASSWORD="$MONGODB_PASSWORD" \
+    MONGODB_HOST="$MONGODB_HOST" \
+    MONGODB_DATABASE="$MONGODB_DATABASE" \
+    MONGODB_COLLECTION="$MONGODB_COLLECTION"
+
+pretty_log "Pushing gemini-api-key-fsdl secret to Modal"
+modal secret create --env "$MODAL_ENVIRONMENT" --force gemini-api-key-fsdl \
+    GOOGLE_API_KEY="$GEMINI_API_KEY"
+
+pretty_log "Secrets pushed."

@@ -1,41 +1,43 @@
-import modal
-
+from youtube_transcript_api import YouTubeTranscriptApi
 import etl.shared
+import requests
+import modal
+import json
+
 
 # extend the shared image with YouTube-handling dependencies
-image = etl.shared.image.pip_install("youtube-transcript-api==0.6.1", "srt==3.5.3")
+image = (
+    etl.shared.base_image
+    .pip_install(
+        "youtube-transcript-api>=1.0",
+        "requests>=2.32",
+    )
+    .add_local_python_source("vecstore", "docstore", "utils", "prompts", "etl")
+)
 
-stub = modal.Stub(
+app = modal.App(
     name="etl-videos",
     image=image,
     secrets=[
         modal.Secret.from_name("mongodb-fsdl"),
     ],
-    mounts=[
-        # we make our local modules available to the container
-        modal.Mount.from_local_python_packages("docstore", "utils")
-    ],
 )
 
 
-@stub.local_entrypoint()
+@app.local_entrypoint()
 def main(json_path="data/videos.json", collection=None, db=None):
-    """Calls the ETL pipeline using a JSON file with YouTube video metadata.
+    """Runs the YouTube ETL pipeline.
 
-    modal run etl/videos.py --json-path /path/to/json
+    modal run --env dev etl/videos.py --json-path /path/to/json
     """
-    import json
-
     with open(json_path) as f:
         video_infos = json.load(f)
 
-    documents = (
-        etl.shared.unchunk(  # each video creates multiple documents, so we flatten
-            extract_subtitles.map(video_infos, return_exceptions=True)
-        )
+    documents = etl.shared.unchunk(
+        extract_subtitles.map(video_infos, return_exceptions=True)
     )
 
-    with etl.shared.stub.run():
+    with etl.shared.app.run():
         chunked_documents = etl.shared.chunk_into(documents, 10)
         list(
             etl.shared.add_to_document_db.map(
@@ -44,117 +46,99 @@ def main(json_path="data/videos.json", collection=None, db=None):
         )
 
 
-@stub.function(
+@app.function(
     retries=modal.Retries(max_retries=3, backoff_coefficient=2.0, initial_delay=5.0)
 )
 def extract_subtitles(video_info):
-    video_id, video_title = video_info["id"], video_info["title"]
+    """Extracts chapters + transcripts for one video and returns documents."""
+    video_id = video_info["id"]
+    video_title = video_info["title"]
+
     subtitles = get_transcript(video_id)
     chapters = get_chapters(video_id)
+
+    if not chapters:
+        # Videos without chapter metadata still produce one document
+        # covering the whole transcript.
+        chapters = [{"title": "Full video", "time": 0}]
+
     chapters = add_transcript(chapters, subtitles)
-
-    documents = create_documents(chapters, video_id, video_title)
-
-    return documents
+    return create_documents(chapters, video_id, video_title)
 
 
 def get_transcript(video_id):
-    from youtube_transcript_api import YouTubeTranscriptApi
+    """Fetches the transcript for a video as a list of dicts.
 
-    return YouTubeTranscriptApi.get_transcript(video_id)
+    youtube-transcript-api 1.x returns Snippet objects; we convert them back
+    to plain dicts so the rest of this module stays unchanged.
+    """
+    ytt = YouTubeTranscriptApi()
+    transcript = ytt.fetch(video_id)
+    return [
+        {"text": s.text, "start": s.start, "duration": s.duration}
+        for s in transcript.snippets
+    ]
 
 
 def get_chapters(video_id):
-    import requests
+    """Fetches chapter metadata from yt.lemnoslife.com.
 
+    Returns [] if the lookup fails — the caller falls back to treating
+    the whole video as one chapter.
+    """
     base_url = "https://yt.lemnoslife.com"
-    request_path = "/videos"
-
-    params = {"id": video_id, "part": "chapters"}
-
-    response = requests.get(base_url + request_path, params=params)
-    response.raise_for_status()
-
-    chapters = response.json()["items"][0]["chapters"]["chapters"]
-    assert len(chapters) >= 0, "Video has no chapters"
+    try:
+        response = requests.get(
+            base_url + "/videos",
+            params={"id": video_id, "part": "chapters"},
+            timeout=30,
+        )
+        response.raise_for_status()
+        items = response.json().get("items") or []
+        if not items:
+            return []
+        chapters = items[0].get("chapters", {}).get("chapters", [])
+    except (requests.RequestException, ValueError, KeyError) as e:
+        print(f"failed to fetch chapters for {video_id}: {e}")
+        return []
 
     for chapter in chapters:
-        del chapter["thumbnails"]
+        chapter.pop("thumbnails", None)
 
     return chapters
 
 
 def add_transcript(chapters, subtitles):
+    """Attaches the transcript text to each chapter."""
     for ii, chapter in enumerate(chapters):
         next_chapter = chapters[ii + 1] if ii < len(chapters) - 1 else {"time": 1e10}
-
-        text = " ".join(
-            [
-                seg["text"]
-                for seg in subtitles
-                if seg["start"] >= chapter["time"]
-                and seg["start"] < next_chapter["time"]
-            ]
+        chapter["text"] = " ".join(
+            seg["text"]
+            for seg in subtitles
+            if chapter["time"] <= seg["start"] < next_chapter["time"]
         )
-
-        chapter["text"] = text
-
     return chapters
 
 
-def create_documents(chapters, id, video_title):
-    base_url = f"https://www.youtube.com/watch?v={id}"
-    query_params_format = "&t={start}s"
+def create_documents(chapters, video_id, video_title):
+    """Converts chapter dicts into documents ready for the document DB."""
+    base_url = f"https://www.youtube.com/watch?v={video_id}"
     documents = []
 
     for chapter in chapters:
         text = chapter["text"].strip()
-        start = chapter["time"]
-        url = base_url + query_params_format.format(start=start)
+        if not text:
+            continue
+        url = f"{base_url}&t={chapter['time']}s"
+        documents.append({
+            "text": text,
+            "metadata": {
+                "source": url,
+                "title": video_title,
+                "chapter-title": chapter["title"],
+                "full-title": f"{video_title} - {chapter['title']}",
+            },
+        })
 
-        document = {"text": text, "metadata": {"source": url}}
+    return etl.shared.enrich_metadata(documents)
 
-        document["metadata"]["title"] = video_title
-        document["metadata"]["chapter-title"] = chapter["title"]
-        document["metadata"]["full-title"] = f"{video_title} - {chapter['title']}"
-
-        documents.append(document)
-
-    documents = etl.shared.enrich_metadata(documents)
-
-    return documents
-
-
-def merge(subtitles, idx):
-    import srt
-
-    new_content = combine_content(subtitles)
-
-    # preserve start as timedelta
-    new_start = seconds_float_to_timedelta(subtitles[0]["start"])
-    # merge durations as timedelta
-    new_duration = seconds_float_to_timedelta(sum(sub["duration"] for sub in subtitles))
-
-    # combine
-    new_end = new_start + new_duration
-
-    return srt.Subtitle(index=idx, start=new_start, end=new_end, content=new_content)
-
-
-def timestamp_from_timedelta(td):
-    return int(td.total_seconds())
-
-
-def combine_content(subtitles):
-    contents = [subtitle["text"].strip() for subtitle in subtitles]
-    return " ".join(contents) + "\n\n"
-
-
-def get_charcount(subtitle):
-    return len(subtitle["text"])
-
-
-def seconds_float_to_timedelta(x_seconds):
-    from datetime import timedelta
-
-    return timedelta(seconds=x_seconds)

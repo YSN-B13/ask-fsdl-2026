@@ -1,101 +1,91 @@
+"""
+Shared utilities for the ETL pipeline.
+"""
+from pymongo.errors import BulkWriteError
+from pymongo import InsertOne
+import docstore
+import hashlib
 import modal
+
 
 # definition of our container image and app for deployment on Modal
 # see app.py for more details
-image = modal.Image.debian_slim(python_version="3.10").pip_install(
-    "langchain~=0.0.98", "pymongo[srv]==3.11"
+base_image  = (
+    modal.Image.debian_slim(python_version="3.10")
+    .pip_install("pymongo>=4.18.1")
 )
 
-stub = modal.Stub(
+image = base_image.add_local_python_source(
+    "vecstore", "docstore", "utils", "prompts", "etl"
+)
+
+app = modal.App(
     name="etl-shared",
+    image=image,
     secrets=[
         modal.Secret.from_name("mongodb-fsdl"),
-    ],
-    mounts=[
-        # we make our local modules available to the container
-        modal.Mount.from_local_python_packages("docstore", "utils")
-    ],
+    ]
 )
 
 
-@stub.function(image=image)
+@app.function()
 def add_to_document_db(documents_json, collection=None, db=None):
-    """Adds a collection of json documents to a database."""
-    from pymongo import InsertOne
+    """Adds a collection of JSON documents to the database in batches.
 
-    import docstore
-
+    Uses ordered=False so a single duplicate _id doesn't abort the batch,
+    and catches BulkWriteError to log partial failures without crashing.
+    """
     collection = docstore.get_collection(collection, db)
+    batch, CHUNK_SIZE = [], 250
+    total_inserted = 0
 
-    requesting, CHUNK_SIZE = [], 250
+    def flush(pending):
+        nonlocal total_inserted
+        if not pending:
+            return
+        try:
+            result = collection.bulk_write(pending, ordered=False)
+            total_inserted += result.inserted_count
+        except BulkWriteError as e:
+            total_inserted += e.details.get("nInserted", 0)
+            print(f"bulk_write partial failure: {e.details.get('writeErrors', [])}")
 
     for document in documents_json:
-        requesting.append(InsertOne(document))
+        batch.append(InsertOne(document))
+        if len(batch) >= CHUNK_SIZE:
+            flush(batch)
+            batch = []
 
-        if len(requesting) >= CHUNK_SIZE:
-            collection.bulk_write(requesting)
-            requesting = []
-
-    if requesting:
-        collection.bulk_write(requesting)
+    flush(batch)
+    print(f"inserted {total_inserted} documents into {collection.full_name}")
 
 
 def enrich_metadata(pages):
-    """Add our metadata: sha256 hash and ignore flag."""
-    import hashlib
-
+    """Add metadata fields: sha256 hash and an ignore flag."""
     for page in pages:
         m = hashlib.sha256()
         m.update(page["text"].encode("utf-8", "replace"))
         page["metadata"]["sha256"] = m.hexdigest()
-        if page["metadata"].get("is_endmatter"):
-            page["metadata"]["ignore"] = True
-        else:
-            page["metadata"]["ignore"] = False
+        page["metadata"]["ignore"] = bool(page["metadata"].get("is_endmatter"))
     return pages
 
 
-def chunk_into(list, n_chunks):
-    """Splits list into n_chunks pieces, non-contiguously."""
-    for ii in range(0, n_chunks):
-        yield list[ii::n_chunks]
+def chunk_into(items, n_chunks):
+    """Splits `items` into n_chunks pieces, non-contiguously."""
+    for ii in range(n_chunks):
+        yield items[ii::n_chunks]
 
 
 def unchunk(list_of_lists):
-    """Recombines a list of lists into a single list."""
-    return [item for sublist in list_of_lists for item in sublist]
+    """Recombines a list of lists into a single list.
 
-
-def display_modal_image(image):
-    """Display a modal.Image cleanly in a Jupyter notebook."""
-    from IPython.display import HTML
-    from pygments import highlight
-    from pygments.formatters import HtmlFormatter
-    from pygments.lexers import get_lexer_by_name
-
-    dockerfile_commands = get_image_dockerfile_commands(image)
-
-    fmt = HtmlFormatter(style="rrt", cssclass="_pygments_code", nobackground=False)
-    css_styles = fmt.get_style_defs(".output_html")
-
-    lexer = get_lexer_by_name("docker")
-    html = highlight("\n".join(dockerfile_commands), lexer, fmt)
-
-    html = f"<style>{css_styles}</style><h1><code>modal.Image</code></h1>{html}"
-
-    return HTML(html)
-
-
-def get_image_dockerfile_commands(image):
-    """Workaround for unavailability of dockerfile commands in modal.Image objects."""
-    image_description = str(image)
-
-    # dockerfile commands appear as a stringified Python list like below
-    # Image(['CMD list', "FROM the modal image"])
-    dockerfile_commands_list_str = image_description[len("Image([") : -len("])")]
-
-    # we "unstringify" the list of strings before returning it
-    dockerfile_commands = dockerfile_commands_list_str.split(", ")
-    dockerfile_commands = [cmd.strip("'").strip('"') for cmd in dockerfile_commands]
-
-    return dockerfile_commands
+    Skips items that aren't iterable — e.g. RemoteError objects returned
+    by `map(..., return_exceptions=True)` when a call fails.
+    """
+    out = []
+    for sublist in list_of_lists:
+        if isinstance(sublist, BaseException):
+            print(f"skipping failed batch: {type(sublist).__name__}: {sublist}")
+            continue
+        out.extend(sublist)
+    return out

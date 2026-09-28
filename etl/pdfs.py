@@ -1,52 +1,63 @@
-import modal
+"""
+ETL for PDF documents (papers).
 
+Fetches metadata from the LLM Lit Review collection, resolves a PDF URL,
+extracts text with PyPDFLoader, annotates endmatter pages, and inserts
+into the document store via etl.shared.add_to_document_db.
+"""
+from langchain_community.document_loaders import PyPDFLoader
+from pathlib import Path
 import etl.shared
+import docstore
+import logging
+import arxiv
+import modal
+import json
+import re
+
 
 # extend the shared image with PDF-handling dependencies
-image = etl.shared.image.pip_install(
-    "arxiv==1.4.7",
-    "pypdf==3.8.1",
+image = (
+    etl.shared.base_image
+    .pip_install(
+        "arxiv>=2.1.0",
+        "pypdf>=5.1.0",
+        "langchain-community>=0.3",
+    )
+    .add_local_python_source("vecstore", "docstore", "utils", "prompts", "etl")
 )
 
-stub = modal.Stub(
+app = modal.App(
     name="etl-pdfs",
     image=image,
-    secrets=[
-        modal.Secret.from_name("mongodb-fsdl"),
-    ],
-    mounts=[
-        # we make our local modules available to the container
-        modal.Mount.from_local_python_packages("docstore", "utils")
-    ],
+    secrets=[modal.Secret.from_name("mongodb-fsdl")]
 )
 
 
-@stub.local_entrypoint()
+@app.local_entrypoint()
 def main(json_path="data/llm-papers.json", collection=None, db=None):
-    """Calls the ETL pipeline using a JSON file with PDF metadata.
+    """Runs the PDF ETL pipeline.
 
-    modal run etl/pdfs.py --json-path /path/to/json
+    modal run --env dev etl/pdfs.py --json-path /path/to/json
     """
-    import json
-    from pathlib import Path
-
     json_path = Path(json_path).resolve()
 
     if not json_path.exists():
-        print(f"{json_path} not found, writing to it from the database.")
+        print(f"{json_path} not found, fetching from the source database.")
         paper_data = fetch_papers.call()
-        paper_data_json = json.dumps(paper_data, indent=2)
         with open(json_path, "w") as f:
-            f.write(paper_data_json)
+            json.dump(paper_data, f, indent=2)
 
     with open(json_path) as f:
         paper_data = json.load(f)
 
+    # Resolve a PDF URL for each paper, then extract text and metadata.
     paper_data = get_pdf_url.map(paper_data, return_exceptions=True)
+    documents = etl.shared.unchunk(
+        extract_pdf.map(paper_data, return_exceptions=True)
+    )
 
-    documents = etl.shared.unchunk(extract_pdf.map(paper_data, return_exceptions=True))
-
-    with etl.shared.stub.run():
+    with etl.shared.app.run():
         chunked_documents = etl.shared.chunk_into(documents, 10)
         list(
             etl.shared.add_to_document_db.map(
@@ -55,140 +66,161 @@ def main(json_path="data/llm-papers.json", collection=None, db=None):
         )
 
 
-@stub.function(
-    image=image,
-    # we can automatically retry execution of Modal functions on failure
-    # -- this retry policy does exponential backoff
+@app.function(
     retries=modal.Retries(backoff_coefficient=2.0, initial_delay=5.0, max_retries=3),
-    # we can also limit the number of concurrent executions of a Modal function
-    # -- here we limit to 50 so we don't hammer the arXiV API too hard
-    concurrency_limit=50,
+    max_containers=50,
 )
 def extract_pdf(paper_data):
-    """Extracts the text from a PDF and adds metadata."""
-    import logging
-
-    import arxiv
-
-    from langchain.document_loaders import PyPDFLoader
+    """Extracts text from a PDF and attaches metadata."""
+    if not isinstance(paper_data, dict):
+        # get_pdf_url may have returned a RemoteError; skip silently.
+        return []
 
     pdf_url = paper_data.get("pdf_url")
     if pdf_url is None:
         return []
 
-    logger = logging.getLogger("pypdf")
-    logger.setLevel(logging.ERROR)
+    logging.getLogger("pypdf").setLevel(logging.ERROR)
 
-    loader = PyPDFLoader(pdf_url)
+    loader = PyPDFLoader(
+        pdf_url,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; ask-fsdl-etl/1.0)"},
+    )
 
     try:
         documents = loader.load_and_split()
-    except Exception:
+    except Exception as e:
+        print(f"failed to load PDF {pdf_url}: {type(e).__name__}: {e}")
         return []
 
-    documents = [document.dict() for document in documents]
-    for document in documents:  # rename page_content to text, handle non-unicode data
+    documents = [document.model_dump() for document in documents]
+    for document in documents:
         document["text"] = (
             document["page_content"].encode("utf-8", errors="replace").decode()
         )
-        document.pop("page_content")
+        document.pop("page_content", None)
 
-    if "arxiv" in pdf_url:
+    if "arxiv" in pdf_url.lower():
         arxiv_id = extract_arxiv_id_from_url(pdf_url)
-        # create an arXiV database client with a 5 second delay between requests
-        client = arxiv.Client(page_size=1, delay_seconds=5, num_retries=5)
-        # describe a search of arXiV's database
-        search_query = arxiv.Search(id_list=[arxiv_id], max_results=1)
-        try:
-            # execute the search with the client and get the first result
-            result = next(client.results(search_query))
-        except ConnectionResetError as e:
-            raise Exception("Triggered request limit on arxiv.org, retrying") from e
-        metadata = {
-            "arxiv_id": arxiv_id,
-            "title": result.title,
-            "date": result.updated,
-        }
+        metadata = fetch_arxiv_metadata(arxiv_id)
+        if metadata is None:
+            metadata = {"title": paper_data.get("title")}
     else:
         metadata = {"title": paper_data.get("title")}
 
     documents = annotate_endmatter(documents)
 
     for document in documents:
-        document["metadata"]["source"] = paper_data.get("url", pdf_url)
+        document["metadata"]["source"] = paper_data.get("url") or pdf_url
         document["metadata"] |= metadata
-        title, page = (
-            document["metadata"]["title"],
-            document["metadata"]["page"],
-        )
+        title = document["metadata"].get("title")
+        page = document["metadata"].get("page")
         if title:
             document["metadata"]["full-title"] = f"{title} - p{page}"
 
     documents = etl.shared.enrich_metadata(documents)
-
     return documents
 
 
-@stub.function()
+@app.function()
 def fetch_papers(collection_name="all-content"):
     """Fetches papers from the LLM Lit Review, https://tfs.ai/llm-lit-review."""
-    import docstore
-
     client = docstore.connect()
 
     collection = client.get_database("llm-lit-review").get_collection(collection_name)
 
-    # Query to retrieve documents with the "PDF?" field set to true
+    # Papers flagged as having a PDF.
     query = {"properties.PDF?.checkbox": {"$exists": True, "$eq": True}}
 
-    # Projection to include the "Name", "url", and "Tags" fields
     projection = {
         "properties.Name.title.plain_text": 1,
         "properties.Link.url": 1,
         "properties.Tags.multi_select.name": 1,
     }
 
-    # Fetch documents matching the query and projection
     documents = list(collection.find(query, projection))
-    assert documents
+    if not documents:
+        print(
+            f"warning: no papers found in llm-lit-review.{collection_name} "
+            f"matching {query}"
+        )
+        return []
 
     papers = []
     for doc in documents:
-        paper = {}
-        paper["title"] = doc["properties"]["Name"]["title"][0]["plain_text"]
-        paper["url"] = doc["properties"]["Link"]["url"]
-        paper["tags"] = [
-            tag["name"]
-            for tag in doc.get("properties", {}).get("Tags", {}).get("multi_select", [])
-        ]
+        props = doc.get("properties", {})
+        try:
+            title = props["Name"]["title"][0]["plain_text"]
+            url = props["Link"]["url"]
+        except (KeyError, IndexError) as e:
+            print(f"skipping malformed record {doc.get('_id')}: {e}")
+            continue
+
+        paper = {
+            "title": title,
+            "url": url,
+            "tags": [
+                tag["name"]
+                for tag in props.get("Tags", {}).get("multi_select", [])
+            ],
+        }
         papers.append(paper)
 
-    assert papers
-
+    if not papers:
+        print("warning: no well-formed papers extracted")
     return papers
 
 
-@stub.function()
+@app.function()
 def get_pdf_url(paper_data):
-    """Attempts to extract a PDF URL from a paper's URL."""
-    url = paper_data["url"]
-    if url.strip("#/").endswith(".pdf"):
-        pdf_url = url
-    elif "arxiv.org" in url:
-        arxiv_id = extract_arxiv_id_from_url(url)
-        pdf_url = f"https://arxiv.org/pdf/{arxiv_id}.pdf"
-    elif "aclanthology.org" in url:
-        pdf_url = url.strip("/")
-        url += ".pdf"
-    else:
-        pdf_url = None
-    paper_data["pdf_url"] = pdf_url
+    """Resolves a PDF URL for one paper.
 
+    If no PDF can be found, sets pdf_url to None; extract_pdf skips those.
+    """
+    url = paper_data["url"]
+    url_lower = url.lower()
+    pdf_url = None
+
+    if url.strip("#/").lower().endswith(".pdf"):
+        pdf_url = url
+    elif "arxiv.org" in url_lower:
+        arxiv_id = extract_arxiv_id_from_url(url)
+        if arxiv_id is not None:
+            pdf_url = f"https://arxiv.org/pdf/{arxiv_id}.pdf"
+    elif "aclanthology.org" in url_lower:
+        pdf_url = url.strip("/") + ".pdf"
+
+    paper_data["pdf_url"] = pdf_url
     return paper_data
 
 
+def fetch_arxiv_metadata(arxiv_id):
+    """Looks up title and last-updated date for an arXiv paper.
+
+    Returns a dict with keys 'arxiv_id', 'title', 'date', or None if the
+    lookup fails (rate limit, unknown ID, network issue).
+    """
+    if arxiv_id is None:
+        return None
+
+    client = arxiv.Client(page_size=1, delay_seconds=5, num_retries=5)
+    search_query = arxiv.Search(id_list=[arxiv_id], max_results=1)
+
+    try:
+        result = next(client.results(search_query))
+    except (ConnectionResetError, StopIteration) as e:
+        print(f"arxiv lookup failed for {arxiv_id}: {type(e).__name__}: {e}")
+        return None
+
+    return {
+        "arxiv_id": arxiv_id,
+        "title": result.title,
+        "date": result.updated.isoformat() if result.updated else None,
+    }
+
+
 def annotate_endmatter(pages, min_pages=6):
-    """Heuristic for detecting reference sections."""
+    """Heuristic for flagging reference sections."""
     out, after_references = [], False
     for idx, page in enumerate(pages):
         content = page["text"].lower()
@@ -199,18 +231,17 @@ def annotate_endmatter(pages, min_pages=6):
     return out
 
 
+# New-style arXiv IDs: 2205.11916, 2205.11916v2.
+# Old-style: quant-ph/0504081, hep-th/9901001.
+_ARXIV_NEW = r"\d{4}\.\d{4,5}(?:v\d+)?"
+_ARXIV_OLD = r"[a-z\-]+(?:\.[A-Z]{2})?/\d{7}(?:v\d+)?"
+_ARXIV_ID = re.compile(
+    rf"(?:arxiv\.org/(?:abs|pdf)/)({_ARXIV_NEW}|{_ARXIV_OLD})",
+    re.IGNORECASE,
+)
+
+
 def extract_arxiv_id_from_url(url):
-    import re
-
-    # pattern = r"(?:arxiv\.org/abs/|arxiv\.org/pdf/)(\d{4}\.\d{4,5}(?:v\d+)?)"
-    match_arxiv_url = r"(?:arxiv\.org/abs/|arxiv\.org/pdf/)"
-    match_id = r"(\d{4}\.\d{4,5}(?:v\d+)?)"  # 4 digits, a dot, and 4 or 5 digits
-    optional_version = r"(?:v\d+)?"
-
-    pattern = match_arxiv_url + match_id + optional_version
-
-    match = re.search(pattern, url)
-    if match:
-        return match.group(1)
-    else:
-        return None
+    """Extracts an arXiv ID from a URL. Returns None if not present."""
+    match = _ARXIV_ID.search(url)
+    return match.group(1) if match else None

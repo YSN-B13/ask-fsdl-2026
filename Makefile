@@ -1,35 +1,29 @@
 # Default: loads .env.dev. Pass ENV=prod to load .env instead.
 ENV_LOADED :=
-
-# default environment is dev; override with `make ENV=prod <target>`
 ENV ?= dev
-
 PIP_FLAGS ?= -qqq
 
-# run make ENV=prod
 ifeq ($(ENV), prod)
-    ifneq (,$(wildcard ./.env))
-        include .env
-        export
-		ENV_LOADED := Loaded config from .env
-    endif
-# run just make (or make ENV=dev)
+    ENV_FILE := .env
 else
-    ifneq (,$(wildcard ./.env.dev))
-        include .env.dev
-        export
-		ENV_LOADED := Loaded config from .env.dev
-    endif
+    ENV_FILE := .env.dev
+endif
+
+ifneq (,$(wildcard $(ENV_FILE)))
+    include $(ENV_FILE)
+    export
+    ENV_LOADED := Loaded config from $(ENV_FILE)
 endif
 
 .PHONY: help it-all frontend serve-frontend slash-command backend serve-backend \
         cli-query vector-index document-store debugger frontend-secrets secrets \
         modal-auth modal-token environment dev-environment logo
+
 .DEFAULT_GOAL := help
 
 help: logo ## get a list of all the targets, and their short descriptions
 	@# source for the incantation: https://marmelab.com/blog/2016/02/29/auto-documented-makefile.html
-	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' Makefile | awk 'BEGIN {FS = ":.*?##"}; {printf "\033[1;38;5;214m%-12s\033[0m %s\n", $$1, $$2}'
+	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' Makefile | awk 'BEGIN {FS = ":.*?##"}; {printf "\033[1;38;5;214m%-16s\033[0m %s\n", $$1, $$2}'
 
 it-all: logo document-store vector-index backend frontend ## runs automated deployment steps
 
@@ -62,11 +56,13 @@ vector-index: secrets ## adds a FAISS vector index into the corpus to the applic
 
 document-store: secrets ## rebuilds a MongoDB collection that contains the document corpus
 	@tasks/pretty_log.sh "See docstore.py and the ETL notebook for details"
-	ifeq ($(ENV), prod)
-		MODAL_ENVIRONMENT=$(ENV) bash tasks/run_etl.sh --db $(MONGODB_DATABASE) --collection $(MONGODB_COLLECTION)
-	else
-		MODAL_ENVIRONMENT=$(ENV) bash tasks/run_etl.sh --drop --db $(MONGODB_DATABASE) --collection $(MONGODB_COLLECTION)
-	endif
+	@if [ "$(ENV)" = "prod" ]; then \
+		MODAL_ENVIRONMENT=$(ENV) bash tasks/run_etl.sh \
+			--db $(MONGODB_DATABASE) --collection $(MONGODB_COLLECTION); \
+	else \
+		MODAL_ENVIRONMENT=$(ENV) bash tasks/run_etl.sh --drop \
+			--db $(MONGODB_DATABASE) --collection $(MONGODB_COLLECTION); \
+	fi
 
 debugger: modal-auth ## starts a debugger running in a Modal container but accessible via the terminal
 	MODAL_ENVIRONMENT=$(ENV) modal shell app.py
@@ -78,7 +74,7 @@ frontend-secrets: modal-auth
 		$(error DISCORD_PUBLIC_KEY is not set. Please set it before running this target.))
 	MODAL_ENVIRONMENT=$(ENV) bash tasks/send_frontend_secrets_to_modal.sh
 
-secrets: modal-auth  ## pushes secrets from .env to Modal
+secrets: modal-auth ## pushes secrets from .env to Modal
 	@$(if $(value GEMINI_API_KEY),, \
 		$(error GEMINI_API_KEY is not set. Please set it before running this target.))
 	@$(if $(value MONGODB_HOST),, \
@@ -87,6 +83,10 @@ secrets: modal-auth  ## pushes secrets from .env to Modal
 		$(error MONGODB_USER is not set. Please set it before running this target.))
 	@$(if $(value MONGODB_PASSWORD),, \
 		$(error MONGODB_PASSWORD is not set. Please set it before running this target.))
+	@$(if $(value MONGODB_DATABASE),, \
+		$(error MONGODB_DATABASE is not set. Please set it before running this target.))
+	@$(if $(value MONGODB_COLLECTION),, \
+		$(error MONGODB_COLLECTION is not set. Please set it before running this target.))
 	MODAL_ENVIRONMENT=$(ENV) bash tasks/send_secrets_to_modal.sh
 
 modal-auth: environment ## confirms authentication with Modal, using secrets from `.env` file
@@ -100,7 +100,7 @@ modal-auth: environment ## confirms authentication with Modal, using secrets fro
 
 modal-token: ## creates token ID and secret for authentication with modal
 	modal token new
-	@tasks/pretty_log.sh "Copy the token info from the file mentioned above into $(if $(filter prod,$(ENV)),.env,.env.dev)"
+	@tasks/pretty_log.sh "Copy the token info into $(ENV_FILE)"
 
 environment: ## installs required environment for deployment and corpus generation
 	@if [ -z "$(ENV_LOADED)" ]; then \
@@ -110,8 +110,8 @@ environment: ## installs required environment for deployment and corpus generati
 	@tasks/pretty_log.sh "$(ENV_LOADED)"
 	python -m pip install $(PIP_FLAGS) -r requirements.txt
 
-dev-environment: environment  ## installs required environment for development
+dev-environment: environment ## installs required environment for development
 	python -m pip install $(PIP_FLAGS) -r requirements-dev.txt
 
-logo:  ## prints the logo
+logo: ## prints the logo
 	@cat logo.txt; printf "\n"

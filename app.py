@@ -49,7 +49,7 @@ app = modal.App(
     secrets=[
         # this is where we add API keys, passwords, and URLs, which are stored on Modal
         modal.Secret.from_name("mongodb-fsdl"),
-        modal.Secret.from_name("openai-api-key-fsdl"),
+        modal.Secret.from_name("gemini-api-key-fsdl"),
     ],
     volumes={
         str(VECTOR_DIR): vector_storage,

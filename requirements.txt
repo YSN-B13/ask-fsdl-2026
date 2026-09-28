@@ -21,3 +21,10 @@ gradio>=6.0.0
 discord.py>=2.7.1
 aiohttp>=3.13.0
 
+arxiv>=2.1.0
+pypdf>=5.1.0
+mistune==2.0.5
+python-slugify>=8.0.1
+smart-open>=7.0
+youtube-transcript-api>=1.0
+requests>=2.32

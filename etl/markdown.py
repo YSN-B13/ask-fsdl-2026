@@ -1,57 +1,61 @@
-import modal
+"""
+ETL for Markdown-format lecture notes from the Full Stack Deep Learning course.
 
+Fetches lecture notes from GitHub-hosted markdown files, splits each into
+per-heading documents, and inserts them into the document store via
+etl.shared.add_to_document_db.
+"""
+from smart_open import open as smart_open
+from slugify import slugify
 import etl.shared
+import mistune
+import modal
+import json
+
 
 # extend the shared image with markdown-handling dependencies
-image = etl.shared.image.pip_install(
-    "mistune==2.0.5",
-    "python-slugify==8.0.1",
-    "smart-open==6.3.0",
+image = (
+    etl.shared.base_image
+    .pip_install(
+        "mistune==2.0.5",
+        "python-slugify>=8.0.1",
+        "smart-open[http]>=7.0",
+    )
+    .add_local_python_source("vecstore", "docstore", "utils", "prompts", "etl")
 )
 
-stub = modal.Stub(
+app = modal.App(
     name="etl-markdown",
     image=image,
     secrets=[
         modal.Secret.from_name("mongodb-fsdl"),
     ],
-    mounts=[
-        # we make our local modules available to the container
-        modal.Mount.from_local_python_packages("docstore", "utils")
-    ],
 )
 
 
-# run simple coordinating code locally, with dependency-inducing processing in the cloud
-@stub.local_entrypoint()
+@app.local_entrypoint()
 def main(json_path="data/lectures-2022.json", collection=None, db=None):
-    """Calls the ETL pipeline using a JSON file with markdown file metadata.
+    """Runs the markdown ETL pipeline.
 
-    modal run etl/markdown.py --json-path /path/to/json
+    modal run --env dev etl/markdown.py --json-path /path/to/json
     """
-    import json
-
     with open(json_path) as f:
         markdown_corpus = json.load(f)
 
-    website_url, md_url = (
-        markdown_corpus["website_url_base"],
-        markdown_corpus["md_url_base"],
-    )
-
+    website_url = markdown_corpus["website_url_base"]
+    md_url = markdown_corpus["md_url_base"]
     lectures = markdown_corpus["lectures"]
 
-    documents = (
-        etl.shared.unchunk(  # each lecture creates multiple documents, so we flatten
-            to_documents.map(
-                lectures,
-                kwargs={"website_url": website_url, "md_url": md_url},
-                return_exceptions=True,
-            )
+    # Each lecture produces multiple documents (one per heading).
+    documents = etl.shared.unchunk(
+        to_documents.map(
+            lectures,
+            kwargs={"website_url": website_url, "md_url": md_url},
+            return_exceptions=True,
         )
     )
 
-    with etl.shared.stub.run():
+    with etl.shared.app.run():
         chunked_documents = etl.shared.chunk_into(documents, 10)
         list(
             etl.shared.add_to_document_db.map(
@@ -60,25 +64,32 @@ def main(json_path="data/lectures-2022.json", collection=None, db=None):
         )
 
 
-@stub.function(image=image)
+@app.function()
 def to_documents(lecture, website_url, md_url):
-    title, title_slug = lecture["title"], lecture["slug"]
+    """Fetches one lecture's markdown and splits it into per-heading documents."""
+    title = lecture["title"]
+    title_slug = lecture["slug"]
     markdown_url = f"{md_url}/{title_slug}/index.md"
-    website_url = f"{website_url}/{title_slug}"
+    lecture_website_url = f"{website_url}/{title_slug}"
 
     text = get_text_from(markdown_url)
+    if not text:
+        return []
+
     headings, heading_slugs = get_target_headings_and_slugs(text)
-
     subtexts = split_by_headings(text, headings)
-    headings, heading_slugs = [""] + headings, [""] + heading_slugs
 
-    sources = [f"{website_url}#{heading}" for heading in heading_slugs]
+    # Prepend an empty heading so the preamble becomes the first document.
+    headings = [""] + headings
+    heading_slugs = [""] + heading_slugs
+
+    sources = [f"{lecture_website_url}#{slug}" for slug in heading_slugs]
     metadatas = [
         {
             "source": source,
             "heading": heading,
             "title": title,
-            "full-title": f"{title} - {heading}",
+            "full-title": f"{title} - {heading}" if heading else title,
         }
         for heading, source in zip(headings, sources)
     ]
@@ -88,24 +99,23 @@ def to_documents(lecture, website_url, md_url):
         for subtext, metadata in zip(subtexts, metadatas)
     ]
 
-    documents = etl.shared.enrich_metadata(documents)
-
-    return documents
+    return etl.shared.enrich_metadata(documents)
 
 
-@stub.function(image=image)
 def get_text_from(url):
-    from smart_open import open
+    """Fetches the contents of a markdown file from a URL."""
+    from smart_open import open as smart_open
 
-    with open(url) as f:
-        contents = f.read()
+    try:
+        with smart_open(url) as f:
+            return f.read()
+    except Exception as e:
+        print(f"failed to fetch {url}: {type(e).__name__}: {e}")
+        return ""
 
-    return contents
 
-
-@stub.function(image=image)
 def get_target_headings_and_slugs(text):
-    """Pull out headings from a markdown document and slugify them."""
+    """Pulls level-2 headings out of a markdown document and slugifies them."""
     import mistune
     from slugify import slugify
 
@@ -115,24 +125,26 @@ def get_target_headings_and_slugs(text):
     heading_objects = [obj for obj in parsed_text if obj["type"] == "heading"]
     h2_objects = [obj for obj in heading_objects if obj["level"] == 2]
 
+    # Skip the "description: " pseudo-heading that appears in some lecture pages.
     targets = [
         obj
         for obj in h2_objects
-        if not (obj["children"][0]["text"].startswith("description: "))
+        if not obj["children"][0]["text"].startswith("description: ")
     ]
     target_headings = [tgt["children"][0]["text"] for tgt in targets]
-
-    heading_slugs = [slugify(target_heading) for target_heading in target_headings]
-
+    heading_slugs = [slugify(h) for h in target_headings]
     return target_headings, heading_slugs
 
 
 def split_by_headings(text, headings):
-    """Separate Markdown text by level-1 headings."""
+    """Splits a markdown document by level-1 headings, preserving the preamble."""
     texts = []
     for heading in reversed(headings):
-        text, section = text.split("# " + heading)
+        marker = "# " + heading
+        if marker not in text:
+            # Heading not found in the body — skip rather than crash.
+            continue
+        text, section = text.split(marker, 1)
         texts.append(f"## {heading}{section}")
     texts.append(text)
-    texts = list(reversed(texts))
-    return texts
+    return list(reversed(texts))
