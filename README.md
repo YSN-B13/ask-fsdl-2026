@@ -325,8 +325,6 @@ You can turn this into a web service with
 make backend
 ```
 
-### VIII. Next steps
-
 ### VII. Run the Discord bot (optional)
 
 The Discord bot runs on Modal as a serverless webhook.
@@ -357,10 +355,3 @@ running correctly, it will respond with a PONG.
 - **`modal secret list` shows an empty table** — you're probably in the wrong
   Modal environment. Run `modal environment list`, then
   `modal secret list --env dev`.
-- **`Function has not been hydrated` during ETL** — the `etl-shared` app
-  needs its own run context. The CLI path (`modal run etl/pdfs.py ...`)
-  handles this automatically; the notebook needs `async with shared.app.run():`.
-- **PDF URLs 404 or timeout** — the `data/llm-papers.json` list ages as
-  papers move. Failures are logged and skipped; a ~30% failure rate is normal.
-- **`smart_open` raises `ImportError: http functionality`** — install the
-  extra: `"smart-open[http]>=7.0"` in the ETL image spec.
